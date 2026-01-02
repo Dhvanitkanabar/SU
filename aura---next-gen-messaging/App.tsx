@@ -64,29 +64,36 @@ const App: React.FC = () => {
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const peerConnection = useRef<RTCPeerConnection | null>(null);
 
-  // --- REAL-TIME CLOUD SYNC LOGIC ---
-  const refreshData = () => {
-    const allUsers = storage.getUsers();
-    if (currentUser) {
-      const otherUsers = allUsers.filter(u => u.id !== currentUser.id);
-      const userList = [AI_BOT, ...otherUsers.filter(u => u.id !== AI_BOT.id)];
-      setUsers(userList);
+
+  useEffect(() => {
+  if (!currentUser) return;
+
+  // 1. Point to the 'users' folder in your Firebase Cloud
+  const usersRef = ref(db, 'users');
+
+  // 2. Start a live stream of data
+  const unsubscribeUsers = onValue(usersRef, (snapshot) => {
+    const data = snapshot.val();
+    if (data) {
+      // Convert the cloud object into a list we can use
+      const cloudUsers: User[] = Object.values(data);
+      
+      // Filter out yourself, but always keep the AI Bot at the top
+      const otherUsers = cloudUsers.filter(u => u.id !== currentUser.id);
+      setUsers([AI_BOT, ...otherUsers]);
+    } else {
+      // If database is empty, just show the AI Bot
+      setUsers([AI_BOT]);
     }
-  };
-  // This logic updates the status to 'delivered' (Double Tick) when the receiver sees it
-useEffect(() => {
-  if (!currentUser || messages.length === 0) return;
-
-  // Filter messages that were sent TO the current user and are currently only 'sent'
-  const incomingUnread = messages.filter(
-    m => m.receiverId === currentUser.id && m.status === 'sent'
-  );
-
-  // Mark them as delivered in the cloud database
-  incomingUnread.forEach(msg => {
-    update(ref(db, 'global_packets/' + msg.id), { status: 'delivered' });
   });
-}, [messages, currentUser]);
+
+  return () => unsubscribeUsers();
+}, [currentUser]);
+
+  // --- REAL-TIME CLOUD SYNC LOGIC ---
+const refreshData = () => {
+  console.log("Aura Cloud Sync is active. Manual refresh skipped.");
+};
   
   useEffect(() => {
   if (!selectedUser || !currentUser) return;
@@ -103,12 +110,23 @@ useEffect(() => {
   
 
   useEffect(() => {
+  if (!currentUser || messages.length === 0) return;
+
+  const incomingUnread = messages.filter(
+    m => m.receiverId === currentUser.id && m.status === 'sent'
+  );
+
+  incomingUnread.forEach(msg => {
+    // This updates the status in the Cloud instantly
+    update(ref(db, 'global_packets/' + msg.id), { status: 'delivered' });
+  });
+}, [messages, currentUser]);
+
+  useEffect(() => {
     if (!currentUser) return;
 
     // 1. Initial Load of Users (Local is fine for this)
-    const allUsers = storage.getUsers();
-    const otherUsers = allUsers.filter(u => u.id !== currentUser.id);
-    setUsers([AI_BOT, ...otherUsers.filter(u => u.id !== AI_BOT.id)]);
+
 
     // 2. Start Listening to the Firebase Cloud
     const packetsRef = ref(db, 'global_packets');
@@ -204,27 +222,7 @@ useEffect(() => {
     setRemoteStream(null); setCallStatus('idle'); setCallRemoteUser(null); setIsCameraOff(false); setIsMuted(false); (window as any)._pendingOffer = null;
   };
 
-  useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === SIGNAL_KEY && e.newValue && currentUser) {
-        const signal: SignalData = JSON.parse(e.newValue);
-        if (signal.to !== currentUser.id) return;
-        if (signal.type === 'offer') {
-          const sender = users.find(u => u.id === signal.from);
-          if (sender) { setCallRemoteUser(sender); setCallStatus('receiving'); (window as any)._pendingOffer = signal; }
-        } else if (signal.type === 'answer') {
-          peerConnection.current?.setRemoteDescription(new RTCSessionDescription(signal.payload));
-          setCallStatus('connected');
-        } else if (signal.type === 'candidate') {
-          peerConnection.current?.addIceCandidate(new RTCIceCandidate(signal.payload)).catch(console.error);
-        } else if (signal.type === 'hangup') { endCall(false); }
-      }
-      if (e.key === 'aura_chat_session' && !e.newValue) setCurrentUser(null);
-      refreshData();
-    };
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, [currentUser, users, callStatus]);
+ 
 
   const toggleDictation = async () => {
     if (isRecording) { stopRecording(); return; }
@@ -325,10 +323,33 @@ const sendMessage = async (type: 'text' | 'image' = 'text', mediaUrl?: string) =
   return counts;
 }, [messages, currentUser]);
 
-  if (!currentUser) return <Auth onLogin={(user) => { setCurrentUser(user); storage.setSession(user); refreshData(); }} />;
+if (!currentUser) return (
+  <Auth onLogin={async (user) => { 
+    try {
+      // 1. Primary: Save/Update user profile in the Firebase Cloud 'users' node
+      // This makes you visible to all other Android and Web users instantly
+      await set(ref(db, 'users/' + user.id), {
+        ...user,
+        lastSeen: Date.now(),
+        status: 'online'
+      }); 
+      
+      // 2. Secondary: Set the local state so the UI logs you in
+      setCurrentUser(user); 
+      
+      // 3. Persistence: Save a small token locally so you don't have to 
+      // log in every time you reopen the app on your phone
+      storage.setSession(user); 
 
+      console.log("Aura Cloud Synchronization Successful");
+    } catch (error) {
+      console.error("Cloud Login Error:", error);
+      alert("System Sync Failed. Check your internet connection.");
+    }
+  }} />
+);
   return (
-    <div className="flex h-screen bg-[#020617] overflow-hidden p-3 md:p-4 gap-4">
+    <div className="flex h-screen bg-[#020617] overflow-hidden p-0 gap-0">
       {callStatus !== 'idle' && callRemoteUser && (
         <VideoCallOverlay
           remoteUser={callRemoteUser}
@@ -345,8 +366,7 @@ const sendMessage = async (type: 'text' | 'image' = 'text', mediaUrl?: string) =
       )}
 
       {/* Aura Sidebar */}
-      <div className="w-80 flex-shrink-0 flex flex-col bg-white/[0.02] backdrop-blur-3xl border border-white/10 rounded-[2.5rem] shadow-2xl overflow-hidden">
-        <header className="p-8 flex items-center justify-between">
+<div className={`${selectedUser ? 'hidden md:flex' : 'flex'} w-full md:w-80 flex-shrink-0 flex flex-col bg-white/[0.02] backdrop-blur-3xl border-r border-white/10 shadow-2xl overflow-hidden`}>        <header className="p-8 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="relative group cursor-pointer">
               <div className="absolute inset-0 bg-indigo-500 rounded-2xl blur-md opacity-0 group-hover:opacity-20 transition-opacity"></div>
@@ -358,7 +378,16 @@ const sendMessage = async (type: 'text' | 'image' = 'text', mediaUrl?: string) =
               <span className="text-[9px] uppercase font-black text-indigo-400 tracking-[0.3em] mt-1.5 inline-block opacity-80">Online Node</span>
             </div>
           </div>
-          <button onClick={() => { storage.setSession(null); setCurrentUser(null); setSelectedUser(null); }} className="p-3 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-2xl transition-all">
+          <button onClick={async () => { 
+  // 1. Tell the cloud you are logging out
+  if (currentUser) {
+    await update(ref(db, 'users/' + currentUser.id), { status: 'offline' });
+  }
+  // 2. Clear local data
+  storage.setSession(null); 
+  setCurrentUser(null); 
+  setSelectedUser(null); 
+}} className="p-3 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-2xl transition-all">
             <LogOut size={18} />
           </button>
         </header>
@@ -410,12 +439,18 @@ const sendMessage = async (type: 'text' | 'image' = 'text', mediaUrl?: string) =
       </div>
 
       {/* Main Experience Area */}
-      <div className="flex-1 flex flex-col bg-white/[0.02] backdrop-blur-3xl border border-white/10 rounded-[2.5rem] shadow-2xl overflow-hidden relative">
-        {selectedUser ? (
+<div className={`${!selectedUser ? 'hidden md:flex' : 'flex'} flex-1 flex flex-col bg-white/[0.01] border-l border-white/10 shadow-2xl overflow-hidden relative`}>        {selectedUser ? (
           <>
             <header className="h-24 flex items-center justify-between px-10 border-b border-white/[0.05] z-10 bg-white/[0.01]">
-              <div className="flex items-center gap-5">
-                <div className="relative">
+            <div className="flex items-center gap-5">
+              <button 
+      onClick={() => setSelectedUser(null)} 
+      className="md:hidden p-2 -ml-4 mr-2 text-slate-400 hover:text-white transition-colors"
+    >
+      <X size={28} /> 
+    </button>
+              <div className="relative">
+                
                   <img src={selectedUser.avatar} className="w-14 h-14 rounded-2xl shadow-2xl border border-white/10" alt="" />
                   <div className="absolute -bottom-1 -right-1 w-4 h-4 bg-green-500 border-2 border-[#020617] rounded-full"></div>
                 </div>
